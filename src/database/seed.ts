@@ -46,6 +46,11 @@ async function seedDatabase(): Promise<void> {
     );
   }
 
+  const [class7Rows] = await database.execute<RowDataPacket[]>(
+    `SELECT id FROM classes WHERE name = '7A' LIMIT 1`
+  );
+  const class7AId = (class7Rows[0]?.id as number | undefined) ?? null;
+
   const [class8Rows] = await database.execute<RowDataPacket[]>(
     `SELECT id FROM classes WHERE name = '8A' LIMIT 1`
   );
@@ -64,6 +69,18 @@ async function seedDatabase(): Promise<void> {
       parentPhone: "081234567801",
       whatsappNumber: "081298765401",
       address: "Jl. Soekarno Hatta No. 12, Malang",
+    },
+    {
+      nisn: "0064892104",
+      fullName: "Yasmine Shavira",
+      gender: "P",
+      birthDate: "2013-02-10",
+      classId: class7AId,
+      attendanceNumber: 28,
+      guardianName: "Bpk. Hendrawan",
+      parentPhone: "081198765432",
+      whatsappNumber: "081234567890",
+      address: "Jl. Soekarno Hatta",
     },
     {
       nisn: "0012345679",
@@ -116,6 +133,25 @@ async function seedDatabase(): Promise<void> {
         student.whatsappNumber,
         student.address,
       ]
+    );
+  }
+
+  // Seed akun siswa default Dimas Pratama (0012345678) agar siap langsung login di Mobile
+  await database.execute(
+    `INSERT INTO users (name, email, password_hash, phone, role, is_active)
+     VALUES (?, ?, ?, ?, 'siswa', 1)
+     ON DUPLICATE KEY UPDATE name = VALUES(name), role = 'siswa', is_active = 1`,
+    ["Dimas Pratama", "dimas@student.mts.id", defaultPasswordHash, "081298765401"]
+  );
+  const [dimasUserRows] = await database.execute<RowDataPacket[]>(
+    `SELECT id FROM users WHERE email = ? LIMIT 1`,
+    ["dimas@student.mts.id"]
+  );
+  const dimasUserId = (dimasUserRows[0]?.id as number | undefined) ?? null;
+  if (dimasUserId) {
+    await database.execute(
+      `UPDATE student_roster SET user_id = ? WHERE nisn = '0012345678' AND (user_id IS NULL OR user_id = ?)`,
+      [dimasUserId, dimasUserId]
     );
   }
 

@@ -105,6 +105,8 @@ export async function handleMobileLogin(
     res.status(200).json({
       success: true,
       message: "Login berhasil.",
+      token: result.token,
+      user: result.user,
       data: result,
     });
   } catch (error) {
