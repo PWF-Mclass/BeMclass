@@ -436,7 +436,7 @@ export async function getFaceScanDetail(params: {
     ensureProfileColumns(),
   ]);
 
-  const [rows] = await database.execute<FaceScanRow[]>(
+  let [rows] = await database.execute<FaceScanRow[]>(
     `SELECT
        aa.id AS scan_id,
        aa.student_id,
@@ -471,10 +471,142 @@ export async function getFaceScanDetail(params: {
     [params.scanId]
   );
 
+  // Fallback jika parameter yang dikirim adalah NISN atau student_id
   if (rows.length === 0) {
-    throw new AppError("Data hasil scan wajah tidak ditemukan.", 404, {
-      code: "NOT_FOUND",
-    });
+    const [byStudentAttempt] = await database.execute<FaceScanRow[]>(
+      `SELECT
+         aa.id AS scan_id,
+         aa.student_id,
+         aa.attempted_at,
+         aa.client_captured_at,
+         aa.latitude,
+         aa.longitude,
+         aa.accuracy_m,
+         aa.distance_m,
+         aa.within_radius,
+         aa.is_mocked,
+         aa.photo_path,
+         aa.face_similarity,
+         aa.face_result,
+         aa.outcome,
+         aa.record_id,
+         aa.device,
+         aa.model_version,
+         sr.nisn,
+         sr.full_name AS student_name,
+         sr.gender,
+         sr.birth_date,
+         sr.guardian_name,
+         sr.attendance_number,
+         sr.class_id,
+         c.name AS class_name
+       FROM attendance_attempts aa
+       INNER JOIN student_roster sr ON sr.id = aa.student_id
+       LEFT JOIN classes c ON c.id = sr.class_id
+       WHERE sr.nisn = ? OR sr.id = ?
+       ORDER BY aa.attempted_at DESC, aa.id DESC
+       LIMIT 1`,
+      [String(params.scanId).padStart(10, "0"), params.scanId]
+    );
+    rows = byStudentAttempt;
+  }
+
+  if (rows.length === 0) {
+    // Jika siswa belum melakukan scan presensi (attendance_attempts), kembalikan data profil & foto referensi wajahnya
+    const [rosterRows] = await database.execute<RowDataPacket[]>(
+      `SELECT
+         sr.id AS student_id,
+         sr.nisn,
+         sr.full_name AS student_name,
+         sr.gender,
+         sr.birth_date,
+         sr.guardian_name,
+         sr.attendance_number,
+         sr.class_id,
+         c.name AS class_name
+       FROM student_roster sr
+       LEFT JOIN classes c ON c.id = sr.class_id
+       WHERE sr.nisn = ? OR sr.id = ?
+       LIMIT 1`,
+      [String(params.scanId).padStart(10, "0"), params.scanId]
+    );
+
+    if (rosterRows.length === 0) {
+      throw new AppError("Data hasil scan wajah tidak ditemukan.", 404, {
+        code: "NOT_FOUND",
+      });
+    }
+
+    const student = rosterRows[0];
+    const studentRosterId = Number(student.student_id);
+    const [schoolConfig, templateRows] = await Promise.all([
+      getSchoolConfig(),
+      database
+        .execute<FaceTemplatePhotoRow[]>(
+          `SELECT photo_path
+           FROM face_templates
+           WHERE student_id = ? AND status = 'active' AND photo_path IS NOT NULL
+           ORDER BY id DESC
+           LIMIT 1`,
+          [studentRosterId]
+        )
+        .then(([res]) => res)
+        .catch(() => [] as FaceTemplatePhotoRow[]),
+    ]);
+
+    const refPhotoPath = templateRows[0]?.photo_path ?? null;
+    let referencePhotoUrl: string | null = null;
+    if (refPhotoPath) {
+      try {
+        referencePhotoUrl = createSignedFileUrl({
+          category: "faces",
+          filename: path.basename(refPhotoPath),
+        });
+      } catch {
+        referencePhotoUrl = null;
+      }
+    }
+
+    return {
+      scan_id: null,
+      attempted_at: null,
+      result: null,
+      result_label: refPhotoPath ? "Wajah Terdaftar (Belum Scan Hari Ini)" : "Belum Enroll Wajah",
+      similarity: null,
+      match_threshold: getFaceMatchThreshold(),
+      outcome: "not_attempted",
+      student: {
+        nisn: String(student.nisn),
+        name: String(student.student_name),
+        class:
+          student.class_id !== null && student.class_id !== undefined
+            ? {
+                id: Number(student.class_id),
+                name: String(student.class_name ?? `Kelas ${student.class_id}`),
+              }
+            : null,
+        gender: (student.gender as "L" | "P" | null) ?? "L",
+        birth_date: formatDateOnly(student.birth_date),
+        guardian_name: student.guardian_name ? String(student.guardian_name) : null,
+        absence_number:
+          student.attendance_number !== null && student.attendance_number !== undefined
+            ? Number(student.attendance_number)
+            : null,
+      },
+      reference_photo_url: referencePhotoUrl,
+      captured_photo_url: null,
+      photo_expired: false,
+      location: {
+        latitude: null,
+        longitude: null,
+        accuracy_m: null,
+        distance_m: null,
+        radius_m: schoolConfig.geofence.radius_m,
+        within_radius: null,
+        is_mocked: false,
+      },
+      record: null,
+    };
   }
 
   const row = rows[0];

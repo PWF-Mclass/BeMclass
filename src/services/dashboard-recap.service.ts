@@ -314,6 +314,8 @@ export async function getDashboardSummary(query: { date?: unknown }) {
     studentRows,
     recordRows,
     announcementRows,
+    pendingLeaveRows,
+    approvedTodayLeaveRows,
   ] = await Promise.all([
     computeSchoolDaysInDates([targetDate]),
     database
@@ -367,11 +369,63 @@ export async function getDashboardSummary(query: { date?: unknown }) {
       )
       .then(([rows]) => rows)
       .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT sr.class_id, COUNT(*) AS pending_count
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.is_active = 1
+           AND lr.status = 'menunggu'
+         GROUP BY sr.class_id`
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT lr.student_id, lr.category
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.is_active = 1
+           AND lr.status = 'disetujui'
+           AND lr.start_date <= ?
+           AND lr.end_date >= ?
+         ORDER BY lr.id DESC`,
+        [targetDate, targetDate]
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
   ]);
+
+  let pendingLeavesCount = 0;
+  const pendingLeavesByClassId = new Map<number, number>();
+  for (const pl of pendingLeaveRows) {
+    const cnt = Number(pl.pending_count ?? 0);
+    pendingLeavesCount += cnt;
+    if (pl.class_id !== null && pl.class_id !== undefined) {
+      pendingLeavesByClassId.set(Number(pl.class_id), cnt);
+    }
+  }
 
   const recordByStudentId = new Map<number, AttendanceRecordSummaryRow>();
   for (const r of recordRows) {
     recordByStudentId.set(Number(r.student_id), r);
+  }
+  for (const l of approvedTodayLeaveRows) {
+    const sid = Number(l.student_id);
+    if (!recordByStudentId.has(sid)) {
+      recordByStudentId.set(sid, {
+        id: 0,
+        student_id: sid,
+        attendance_date: targetDate,
+        status: l.category === "sakit" ? "sakit" : "izin",
+        source: "leave",
+        check_in_at: null,
+        late_minutes: null,
+        late_reason: null,
+        late_note: null,
+        attempt_id: null,
+      } as AttendanceRecordSummaryRow);
+    }
   }
 
   let totalHadir = 0;
@@ -444,7 +498,10 @@ export async function getDashboardSummary(query: { date?: unknown }) {
         ? "Normal"
         : "Perlu Cek";
 
+    const classPendingLeaves = pendingLeavesByClassId.get(classId) ?? 0;
+
     const noteParts: string[] = [];
+    if (classPendingLeaves > 0) noteParts.push(`${classPendingLeaves} Pengajuan Izin`);
     if (terlambat > 0) noteParts.push(`${terlambat} Telat`);
     if (izin > 0) noteParts.push(`${izin} Izin`);
     if (sakit > 0) noteParts.push(`${sakit} Sakit`);
@@ -466,6 +523,7 @@ export async function getDashboardSummary(query: { date?: unknown }) {
       sakit,
       belum_hadir: belumHadir,
       alpa,
+      pending_leaves: classPendingLeaves,
       attendance_count: attendanceCount,
       attendance_percent: attendancePercent,
       status,
@@ -523,12 +581,14 @@ export async function getDashboardSummary(query: { date?: unknown }) {
         terlambat: totalTerlambat,
         izin: totalIzin,
         sakit: totalSakit,
+        pending_leaves: pendingLeavesCount,
       },
       belum_hadir_alpa: {
         total: totalBelumHadir + totalAlpa,
         belum_hadir: totalBelumHadir,
         alpa: totalAlpa,
       },
+      pending_leaves: pendingLeavesCount,
     },
     classes,
     announcements,
@@ -558,6 +618,8 @@ export async function getRecapOverview(query: {
     studentRows,
     recordRows,
     outsideAttemptRows,
+    pendingLeaveRows,
+    approvedLeaveRows,
   ] = await Promise.all([
     getSchoolConfig(),
     computeSchoolDaysInDates(range.dates),
@@ -600,7 +662,36 @@ export async function getRecapOverview(query: {
       )
       .then(([rows]) => rows)
       .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT COUNT(*) AS pending_count
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.is_active = 1
+           AND lr.status = 'menunggu'`
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT
+           SUM(CASE WHEN lr.category = 'sakit' THEN 1 ELSE 0 END) AS approved_sakit_count,
+           SUM(CASE WHEN lr.category != 'sakit' THEN 1 ELSE 0 END) AS approved_izin_count
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.is_active = 1
+           AND lr.status = 'disetujui'
+           AND lr.end_date >= ?
+           AND lr.start_date <= ?`,
+        [range.from, range.to]
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
   ]);
+
+  const pendingLeavesCount = Number(pendingLeaveRows[0]?.pending_count ?? 0);
+  const approvedSakitRequests = Number(approvedLeaveRows[0]?.approved_sakit_count ?? 0);
+  const approvedIzinRequests = Number(approvedLeaveRows[0]?.approved_izin_count ?? 0);
 
   let hadir = 0;
   let terlambat = 0;
@@ -633,15 +724,21 @@ export async function getRecapOverview(query: {
       ? Math.min(100, Math.round(((hadir + terlambat) / denominator) * 100))
       : 0;
 
+  const effectiveIzin = Math.max(izin, approvedIzinRequests);
+  const effectiveSakit = Math.max(sakit, approvedSakitRequests);
+
   return {
     from: range.from,
     to: range.to,
     monitored_classes: classRows.length,
     attendance_avg_percent: attendanceAvgPercent,
     leave_total: {
-      izin,
-      sakit,
-      total: izin + sakit,
+      izin: effectiveIzin,
+      sakit: effectiveSakit,
+      total: effectiveIzin + effectiveSakit,
+      pending_requests: pendingLeavesCount,
+      approved_sakit_requests: approvedSakitRequests,
+      approved_izin_requests: approvedIzinRequests,
     },
     alpa_total: alpa,
     gps: {
@@ -666,7 +763,7 @@ export async function getRecapClasses(query: {
     query.to ?? query.date
   );
 
-  const [schoolDaysInfo, classRows, studentRows, recordRows] = await Promise.all([
+  const [schoolDaysInfo, classRows, studentRows, recordRows, pendingClassLeaveRows, approvedClassLeaveRows] = await Promise.all([
     computeSchoolDaysInDates(range.dates),
     database
       .execute<ClassRow[]>(
@@ -697,7 +794,42 @@ export async function getRecapClasses(query: {
         [range.from, range.to]
       )
       .then(([rows]) => rows),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT sr.class_id, COUNT(*) AS pending_count
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.is_active = 1
+           AND lr.status = 'menunggu'
+         GROUP BY sr.class_id`
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT
+           lr.student_id,
+           lr.category,
+           DATE_FORMAT(lr.start_date, '%Y-%m-%d') AS start_date,
+           DATE_FORMAT(lr.end_date, '%Y-%m-%d') AS end_date
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.is_active = 1
+           AND lr.status = 'disetujui'
+           AND lr.end_date >= ?
+           AND lr.start_date <= ?`,
+        [range.from, range.to]
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
   ]);
+
+  const pendingLeavesByClassId = new Map<number, number>();
+  for (const pl of pendingClassLeaveRows) {
+    if (pl.class_id !== null && pl.class_id !== undefined) {
+      pendingLeavesByClassId.set(Number(pl.class_id), Number(pl.pending_count ?? 0));
+    }
+  }
 
   const studentsByClassId = new Map<number, ActiveStudentRow[]>();
   const studentClassMap = new Map<number, number>();
@@ -714,8 +846,11 @@ export async function getRecapClasses(query: {
     { hadir: number; terlambat: number; izin: number; sakit: number; alpa: number }
   >();
 
+  const recordedStudentDates = new Set<string>();
   for (const r of recordRows) {
-    const cid = studentClassMap.get(Number(r.student_id));
+    const sid = Number(r.student_id);
+    recordedStudentDates.add(`${sid}:${r.attendance_date}`);
+    const cid = studentClassMap.get(sid);
     if (cid === undefined) continue;
     const st = statsByClassId.get(cid) ?? {
       hadir: 0,
@@ -730,6 +865,29 @@ export async function getRecapClasses(query: {
     else if (r.status === "sakit") st.sakit += 1;
     else if (r.status === "alpa") st.alpa += 1;
     statsByClassId.set(cid, st);
+  }
+
+  for (const l of approvedClassLeaveRows) {
+    const sid = Number(l.student_id);
+    const cid = studentClassMap.get(sid);
+    if (cid === undefined) continue;
+    const startStr = String(l.start_date);
+    const endStr = String(l.end_date);
+    for (const d of range.dates) {
+      if (d >= startStr && d <= endStr && !recordedStudentDates.has(`${sid}:${d}`)) {
+        recordedStudentDates.add(`${sid}:${d}`);
+        const st = statsByClassId.get(cid) ?? {
+          hadir: 0,
+          terlambat: 0,
+          izin: 0,
+          sakit: 0,
+          alpa: 0,
+        };
+        if (l.category === "sakit") st.sakit += 1;
+        else st.izin += 1;
+        statsByClassId.set(cid, st);
+      }
+    }
   }
 
   const effectiveSchoolDays = Math.max(1, schoolDaysInfo.schoolDaysCount);
@@ -767,6 +925,7 @@ export async function getRecapClasses(query: {
       sakit: st.sakit,
       alpa: st.alpa,
       belum_hadir: belumHadir,
+      pending_leaves: pendingLeavesByClassId.get(classId) ?? 0,
       attendance_percent: attendancePercent,
       status:
         totalStudents === 0 || attendancePercent >= alertThreshold
@@ -782,15 +941,16 @@ export async function getRecapClasses(query: {
  * dilengkapi `record_id` dan `scan_id` (tautan ke `GET /api/face-scans/:scanId`).
  */
 export async function getRecapClassDetail(params: {
-  classId: number;
+  classId: number | string;
   date?: unknown;
   q?: unknown;
   status?: unknown;
 }) {
-  if (!Number.isSafeInteger(params.classId) || params.classId <= 0) {
+  const rawClassIdentifier = String(params.classId ?? "").trim();
+  if (!rawClassIdentifier) {
     throw new AppError("ID kelas tidak valid.", 400, {
       code: "VALIDATION_ERROR",
-      errors: { classId: "ID kelas harus berupa bilangan bulat positif." },
+      errors: { classId: "ID kelas harus berupa bilangan bulat positif atau nama kelas." },
     });
   }
 
@@ -819,10 +979,50 @@ export async function getRecapClassDetail(params: {
     filterStatus = rawStatus as ClassDetailStudentStatus;
   }
 
-  const [classRows] = await database.execute<ClassRow[]>(
-    `SELECT id, name, grade_level FROM classes WHERE id = ? LIMIT 1`,
-    [params.classId]
-  );
+  let classRows: ClassRow[] = [];
+  if (/^\d+$/.test(rawClassIdentifier)) {
+    const numericVal = Number(rawClassIdentifier);
+    if (numericVal <= 0) {
+      throw new AppError("ID kelas tidak valid.", 400, {
+        code: "VALIDATION_ERROR",
+        errors: { classId: "ID kelas harus berupa bilangan bulat positif." },
+      });
+    }
+    const [byId] = await database.execute<ClassRow[]>(
+      `SELECT c.id, c.name, c.grade_level, u.name AS homeroom_teacher_name
+       FROM classes c
+       LEFT JOIN users u ON u.id = c.homeroom_teacher_id
+       WHERE c.id = ?
+       LIMIT 1`,
+      [numericVal]
+    );
+    classRows = byId;
+
+    if (classRows.length === 0) {
+      const [byGrade] = await database.execute<ClassRow[]>(
+        `SELECT c.id, c.name, c.grade_level, u.name AS homeroom_teacher_name
+         FROM classes c
+         LEFT JOIN users u ON u.id = c.homeroom_teacher_id
+         WHERE c.grade_level = ?
+         ORDER BY c.name ASC, c.id ASC
+         LIMIT 1`,
+        [numericVal]
+      );
+      classRows = byGrade;
+    }
+  } else {
+    const cleanedName = rawClassIdentifier.replace(/^kelas\s+/i, "").trim();
+    const [byName] = await database.execute<ClassRow[]>(
+      `SELECT c.id, c.name, c.grade_level, u.name AS homeroom_teacher_name
+       FROM classes c
+       LEFT JOIN users u ON u.id = c.homeroom_teacher_id
+       WHERE LOWER(c.name) = LOWER(?) OR LOWER(c.name) = LOWER(?)
+       ORDER BY c.id ASC
+       LIMIT 1`,
+      [rawClassIdentifier, cleanedName]
+    );
+    classRows = byName;
+  }
 
   if (classRows.length === 0) {
     throw new AppError("Kelas tidak ditemukan.", 404, {
@@ -831,15 +1031,16 @@ export async function getRecapClassDetail(params: {
   }
 
   const cls = classRows[0];
+  const resolvedClassId = Number(cls.id);
 
-  const [studentRows, recordRows, attemptRows] = await Promise.all([
+  const [studentRows, recordRows, attemptRows, leaveRows, upcomingLeaveRows] = await Promise.all([
     database
       .execute<ActiveStudentRow[]>(
         `SELECT id, nisn, full_name, class_id, attendance_number
          FROM student_roster
          WHERE class_id = ? AND is_active = 1
          ORDER BY COALESCE(attendance_number, 999999) ASC, full_name ASC, id ASC`,
-        [params.classId]
+        [resolvedClassId]
       )
       .then(([rows]) => rows),
     database
@@ -854,13 +1055,14 @@ export async function getRecapClassDetail(params: {
            ar.late_minutes,
            ar.late_reason,
            ar.late_note,
-           ar.attempt_id
+           ar.attempt_id,
+           ar.leave_request_id
          FROM attendance_records ar
          INNER JOIN student_roster sr ON sr.id = ar.student_id
          WHERE sr.class_id = ?
            AND sr.is_active = 1
            AND ar.attendance_date = ?`,
-        [params.classId, targetDate]
+        [resolvedClassId, targetDate]
       )
       .then(([rows]) => rows),
     database
@@ -872,7 +1074,50 @@ export async function getRecapClassDetail(params: {
            AND sr.is_active = 1
            AND DATE(aa.attempted_at) = ?
          ORDER BY aa.attempted_at DESC, aa.id DESC`,
-        [params.classId, targetDate]
+        [resolvedClassId, targetDate]
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT
+           lr.id AS leave_id,
+           lr.student_id,
+           lr.category,
+           lr.status AS leave_status,
+           lr.reason,
+           DATE_FORMAT(lr.start_date, '%Y-%m-%d') AS start_date,
+           DATE_FORMAT(lr.end_date, '%Y-%m-%d') AS end_date
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.class_id = ?
+           AND sr.is_active = 1
+           AND lr.status IN ('menunggu', 'disetujui')
+           AND lr.start_date <= ?
+           AND lr.end_date >= ?
+         ORDER BY FIELD(lr.status, 'disetujui', 'menunggu'), lr.id DESC`,
+        [resolvedClassId, targetDate, targetDate]
+      )
+      .then(([rows]) => rows)
+      .catch(() => [] as RowDataPacket[]),
+    database
+      .execute<RowDataPacket[]>(
+        `SELECT
+           lr.id AS leave_id,
+           lr.student_id,
+           lr.category,
+           lr.status AS leave_status,
+           lr.reason,
+           DATE_FORMAT(lr.start_date, '%Y-%m-%d') AS start_date,
+           DATE_FORMAT(lr.end_date, '%Y-%m-%d') AS end_date
+         FROM leave_requests lr
+         INNER JOIN student_roster sr ON sr.id = lr.student_id
+         WHERE sr.class_id = ?
+           AND sr.is_active = 1
+           AND lr.status IN ('menunggu', 'disetujui')
+           AND lr.end_date >= ?
+         ORDER BY lr.start_date ASC, lr.id DESC`,
+        [resolvedClassId, targetDate]
       )
       .then(([rows]) => rows)
       .catch(() => [] as RowDataPacket[]),
@@ -891,6 +1136,22 @@ export async function getRecapClassDetail(params: {
     }
   }
 
+  const activeLeaveByStudentId = new Map<number, RowDataPacket>();
+  for (const l of leaveRows) {
+    const sid = Number(l.student_id);
+    if (!activeLeaveByStudentId.has(sid)) {
+      activeLeaveByStudentId.set(sid, l);
+    }
+  }
+
+  const upcomingLeaveByStudentId = new Map<number, RowDataPacket>();
+  for (const l of upcomingLeaveRows) {
+    const sid = Number(l.student_id);
+    if (!upcomingLeaveByStudentId.has(sid)) {
+      upcomingLeaveByStudentId.set(sid, l);
+    }
+  }
+
   const counts = {
     total_students: studentRows.length,
     hadir: 0,
@@ -904,9 +1165,21 @@ export async function getRecapClassDetail(params: {
   const allStudentItems = studentRows.map((st) => {
     const sid = Number(st.id);
     const rec = recordByStudentId.get(sid);
-    const status: ClassDetailStudentStatus = rec
+    const activeLeave = activeLeaveByStudentId.get(sid);
+    const upcomingLeave = upcomingLeaveByStudentId.get(sid);
+
+    let status: ClassDetailStudentStatus = rec
       ? (rec.status as ClassDetailStudentStatus)
       : "belum_hadir";
+
+    // Jika pada targetDate ada surat izin yang sudah disetujui namun belum tertulis di attendance_records
+    if (
+      status === "belum_hadir" &&
+      activeLeave &&
+      activeLeave.leave_status === "disetujui"
+    ) {
+      status = activeLeave.category === "sakit" ? "sakit" : "izin";
+    }
 
     if (status === "hadir") counts.hadir += 1;
     else if (status === "terlambat") counts.terlambat += 1;
@@ -920,7 +1193,27 @@ export async function getRecapClassDetail(params: {
         ? Number(rec.attempt_id)
         : (latestScanIdByStudentId.get(sid) ?? null);
 
+    let note = formatStudentAttendanceNote({
+      status,
+      lateMinutes: rec?.late_minutes ?? null,
+      lateReason: rec?.late_reason ?? null,
+      lateNote: rec?.late_note ?? null,
+    });
+    if (!note && activeLeave && activeLeave.leave_status === "menunggu") {
+      note = `Mengajukan ${activeLeave.category === "sakit" ? "Sakit" : "Izin"} (Menunggu Review): ${activeLeave.reason}`;
+    } else if (activeLeave && (status === "izin" || status === "sakit")) {
+      note = `${status === "sakit" ? "Sakit" : "Izin"}: ${activeLeave.reason}`;
+    } else if (!note && upcomingLeave) {
+      const catLabel = upcomingLeave.category === "sakit" ? "Sakit" : "Izin";
+      const stLabel =
+        upcomingLeave.leave_status === "disetujui" ? "Disetujui" : "Menunggu";
+      note = `Jadwal ${catLabel} (${stLabel}) ${upcomingLeave.start_date} s.d. ${upcomingLeave.end_date}: ${upcomingLeave.reason}`;
+    }
+
+    const displayLeave = activeLeave ?? upcomingLeave ?? null;
+
     return {
+      student_id: sid,
       nisn: String(st.nisn),
       name: String(st.full_name),
       absence_number:
@@ -929,14 +1222,19 @@ export async function getRecapClassDetail(params: {
           : null,
       status,
       check_in_at: rec ? toIsoStringOrNull(rec.check_in_at) : null,
-      note: formatStudentAttendanceNote({
-        status,
-        lateMinutes: rec?.late_minutes ?? null,
-        lateReason: rec?.late_reason ?? null,
-        lateNote: rec?.late_note ?? null,
-      }),
+      note,
       record_id: rec ? Number(rec.id) : null,
       scan_id: scanId,
+      leave_request: displayLeave
+        ? {
+            id: Number(displayLeave.leave_id),
+            category: String(displayLeave.category),
+            status: String(displayLeave.leave_status),
+            reason: String(displayLeave.reason),
+            start_date: String(displayLeave.start_date),
+            end_date: String(displayLeave.end_date),
+          }
+        : null,
     };
   });
 
@@ -964,6 +1262,9 @@ export async function getRecapClassDetail(params: {
       id: Number(cls.id),
       name: String(cls.name),
       grade: Number(cls.grade_level),
+      homeroom_teacher_name: cls.homeroom_teacher_name
+        ? String(cls.homeroom_teacher_name)
+        : null,
     },
     date: targetDate,
     counts,

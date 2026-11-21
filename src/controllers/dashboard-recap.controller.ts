@@ -103,15 +103,15 @@ export async function handleGetRecapClassDetail(
   try {
     ensureStaffRole(req);
     const rawClassId = String(req.params.classId ?? "").trim();
-    if (!/^\d+$/.test(rawClassId)) {
+    if (!rawClassId) {
       throw new AppError("ID kelas tidak valid.", 400, {
         code: "VALIDATION_ERROR",
-        errors: { classId: "ID kelas harus berupa bilangan bulat positif." },
+        errors: { classId: "ID kelas wajib diisi." },
       });
     }
 
     const data = await getRecapClassDetail({
-      classId: Number(rawClassId),
+      classId: /^\d+$/.test(rawClassId) ? Number(rawClassId) : rawClassId,
       date: req.query.date,
       q: req.query.q,
       status: req.query.status,
